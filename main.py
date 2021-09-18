@@ -1,17 +1,29 @@
+#!/usr/bin/env python
+
+import logging
+import os
 from argparse import ArgumentParser
+
+import tensorflow as tf
+from tqdm.auto import tqdm
+
 from dataloader import DataLoader
 from model import FastSRGAN
-import tensorflow as tf
-import os
 
 parser = ArgumentParser()
-parser.add_argument('--image_dir', type=str, help='Path to high resolution image directory.')
+parser.add_argument('--image_dir', default="/nlp/projekty/ahisto/ahisto-superresolution/cdb/", type=str,
+                    help='Path to high resolution image directory.')
 parser.add_argument('--batch_size', default=8, type=int, help='Batch size for training.')
-parser.add_argument('--epochs', default=1, type=int, help='Number of epochs for training')
+parser.add_argument('--pretrain_epochs', default=1, type=int,
+                    help='Number of epochs for training SRResNet without discriminator.')
+parser.add_argument('--train_epochs', default=10, type=int, help='Number of epochs for training.')
+
 parser.add_argument('--hr_size', default=384, type=int, help='Low resolution input size.')
+
 parser.add_argument('--lr', default=1e-4, type=float, help='Learning rate for optimizers.')
-parser.add_argument('--save_iter', default=200, type=int,
+parser.add_argument('--save_iter', default=10, type=int,
                     help='The number of iterations to save the tensorboard summaries and models.')
+parser.add_argument('--model', default='generator', type=str, help='Name of the model to be saved.')
 
 
 @tf.function
@@ -33,24 +45,32 @@ def pretrain_step(model, x, y):
     return loss_mse
 
 
-def pretrain_generator(model, dataset, writer):
+def pretrain(model, dataset, log_iter, writer, model_name, aug_fn):
     """Function that pretrains the generator slightly, to avoid local minima.
     Args:
         model: The keras model to train.
         dataset: A tf dataset object of low and high res images to pretrain over.
+        log_iter: Log each log_iter iterations
         writer: A summary writer object.
+        model_name: A name of the model_name to save
+        aug_fn: function to use as a image x augmentation
     Returns:
         None
     """
     with writer.as_default():
-        iteration = 0
-        for _ in range(1):
-            for x, y in dataset:
-                loss = pretrain_step(model, x, y)
-                if iteration % 20 == 0:
-                    tf.summary.scalar('MSE Loss', loss, step=tf.cast(iteration, tf.int64))
-                    writer.flush()
-                iteration += 1
+        for x, y in tqdm(dataset):
+            if aug_fn is not None:
+                x = tf.map_fn(aug_fn, x)
+            loss = pretrain_step(model, x, y)
+            if model.pretrain_iterations % log_iter == 0:
+                tf.summary.scalar('MSE Loss', loss, step=tf.cast(model.pretrain_iterations, tf.int64))
+                tf.summary.image('Low Res', tf.cast(255 * x, tf.uint8), step=model.pretrain_iterations)
+                tf.summary.image('High Res', tf.cast(255 * (y + 1.0) / 2.0, tf.uint8), step=model.pretrain_iterations)
+                tf.summary.image('Generated', tf.cast(255 * (model.generator.predict(x) + 1.0) / 2.0, tf.uint8),
+                                 step=model.pretrain_iterations)
+                model.generator.save(f'models/{model_name}.h5')
+                writer.flush()
+            model.pretrain_iterations += 1
 
 
 @tf.function
@@ -98,7 +118,7 @@ def train_step(model, x, y):
     return d_loss, adv_loss, content_loss, mse_loss
 
 
-def train(model, dataset, log_iter, writer):
+def train(model, dataset, log_iter, writer, model_name, aug_fn):
     """
     Function that defines a single training step for the SR-GAN.
     Args:
@@ -108,10 +128,14 @@ def train(model, dataset, log_iter, writer):
         log_iter: Number of iterations after which to add logs in 
                   tensorboard.
         writer: Summary writer
+        model_name: A name of the model_name to save
+        aug_fn: function to use as a image x augmentation
     """
     with writer.as_default():
         # Iterate over dataset
-        for x, y in dataset:
+        for x, y in tqdm(dataset):
+            if aug_fn is not None:
+                x = tf.map_fn(aug_fn, x)
             disc_loss, adv_loss, content_loss, mse_loss = train_step(model, x, y)
             # Log tensorboard summaries if log iteration is reached.
             if model.iterations % log_iter == 0:
@@ -123,8 +147,9 @@ def train(model, dataset, log_iter, writer):
                 tf.summary.image('High Res', tf.cast(255 * (y + 1.0) / 2.0, tf.uint8), step=model.iterations)
                 tf.summary.image('Generated', tf.cast(255 * (model.generator.predict(x) + 1.0) / 2.0, tf.uint8),
                                  step=model.iterations)
-                model.generator.save('models/generator.h5')
-                model.discriminator.save('models/discriminator.h5')
+
+                model.generator.save(f'models/{model_name}.h5')
+                model.discriminator.save(f'models/{model_name}_discriminator.h5')
                 writer.flush()
             model.iterations += 1
 
@@ -137,25 +162,37 @@ def main():
     if not os.path.exists('models'):
         os.makedirs('models')
 
+    if not os.path.exists(f'logs/{args.model}'):
+        os.makedirs(f'logs/{args.model}')
+
     # Create the tensorflow dataset.
+    logging.info("Preparing dataset")
     ds = DataLoader(args.image_dir, args.hr_size).dataset(args.batch_size)
 
+    logging.info("Initializing GAN")
     # Initialize the GAN object.
     gan = FastSRGAN(args)
 
-    # Define the directory for saving pretrainig loss tensorboard summary.
-    pretrain_summary_writer = tf.summary.create_file_writer('logs/pretrain')
+    # Define the directory for saving pre-training loss tensorboard summary.
+    pretrain_summary_writer = tf.summary.create_file_writer(f'logs/pretrain/{args.model}')
 
-    # Run pre-training.
-    pretrain_generator(gan, ds, pretrain_summary_writer)
+    logging.info("Pretraining ...")
+    # Run SRResNet pre-training.
+    log_iter = args.save_iter
 
-    # Define the directory for saving the SRGAN training tensorbaord summary.
-    train_summary_writer = tf.summary.create_file_writer('logs/train')
+    for _ in range(args.pretrain_epochs):
+        pretrain(gan, ds, log_iter, pretrain_summary_writer, args.model, aug_fn=None)
 
+    # Define the directory for saving the SRGAN training tensorboard summary.
+    train_summary_writer = tf.summary.create_file_writer(f'logs/train/{args.model}')
+
+    logging.info("Training")
     # Run training.
-    for _ in range(args.epochs):
-        train(gan, ds, args.save_iter, train_summary_writer)
+    for _ in range(args.train_epochs):
+        train(gan, ds, args.save_iter, train_summary_writer, args.model, aug_fn=None)
+    logging.info("Done")
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.ERROR)
     main()

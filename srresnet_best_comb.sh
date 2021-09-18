@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=11 TF_CPP_MIN_LOG_LEVEL=3 ./run_experiment.py --model srresnet_20_sap_001_jpeg_50 --pretrain_epochs 20 --train_epochs 0 --salt_and_pepper_amount 0.01 --salt_and_pepper_ratio 0.5 --jpeg_quality 50
